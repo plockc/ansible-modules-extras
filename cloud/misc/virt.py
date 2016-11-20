@@ -106,6 +106,7 @@ VIRT_SUCCESS = 0
 VIRT_UNAVAILABLE=2
 
 import sys
+import time
 
 try:
     import libvirt
@@ -121,14 +122,16 @@ HOST_COMMANDS = ['freemem', 'list_vms', 'info', 'nodeinfo', 'virttype']
 ALL_COMMANDS.extend(VM_COMMANDS)
 ALL_COMMANDS.extend(HOST_COMMANDS)
 
+# https://libvirt.org/html/libvirt-libvirt-domain.html#virDomainState
 VIRT_STATE_NAME_MAP = {
    0 : "running",
    1 : "running",
    2 : "running",
    3 : "paused",
-   4 : "shutdown",
+   4 : "shutting_down",
    5 : "shutdown",
-   6 : "crashed"
+   6 : "crashed",
+   7 : "suspended"
 }
 
 class VMNotFound(Exception):
@@ -143,7 +146,9 @@ class LibvirtConnection(object):
         cmd = "uname -r"
         rc, stdout, stderr = self.module.run_command(cmd)
 
-        if "xen" in stdout:
+        if uri is None:
+            conn = libvirt.open()
+        elif "xen" in stdout:
             conn = libvirt.open(None)
         elif "esx" in uri:
             auth = [[libvirt.VIR_CRED_AUTHNAME, libvirt.VIR_CRED_NOECHOPROMPT], [], None]
@@ -156,37 +161,60 @@ class LibvirtConnection(object):
 
         self.conn = conn
 
+    def find_defined_vm(self, vmid):
+        defined_flag = libvirt.VIR_CONNECT_LIST_DOMAINS_PERSISTENT
+        vm = next((d for d in self.conn.listAllDomains(defined_flag)
+                   if d.name()==vmid), None)
+
+        if vm is None:
+            raise VMNotFound("virtual machine (%s) not found" % vmid)
+
+        return vm
+        
     def find_vm(self, vmid):
-        """
-        Extra bonus feature: vmid = -1 returns a list of everything
-        """
-        conn = self.conn
-
-        vms = []
-
-        # this block of code borrowed from virt-manager:
-        # get working domain's name
-        ids = conn.listDomainsID()
-        for id in ids:
-            vm = conn.lookupByID(id)
-            vms.append(vm)
-        # get defined domain
-        names = conn.listDefinedDomains()
-        for name in names:
-            vm = conn.lookupByName(name)
-            vms.append(vm)
-
+        """Extra bonus feature: vmid = -1 returns a list of everything """
         if vmid == -1:
-            return vms
+            return self.conn.listAllDomains()
 
-        for vm in vms:
-            if vm.name() == vmid:
-                return vm
+        vm = next((d for d in self.conn.listAllDomains() if d.name()==vmid),
+                  None)
 
-        raise VMNotFound("virtual machine %s not found" % vmid)
+        if vm is None:
+            raise VMNotFound("virtual machine (%s) not found" % vmid)
+
+        return vm
+
+    def wait_for_state(self, vmid, action, target_state):
+        vm = self.find_vm(vmid)
+        current_state = vm.info()[0]
+        def event_callback(conn, domain, event, detail, opaque):
+            current_state = event
+        callback_id = self.conn.domainEventRegisterAny(
+            vm, libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE, event_callback, None)
+        def timer_callback(timer, opaque):
+            pass
+        now = time.time() * 1000.0
+        timeout = 5000
+        end_time = now + timeout
+        timer_id = libvirt.virEventAddTimeout(int(timeout), timer_callback, None)
+        action(vm)
+        while current_state != target_state:
+            libvirt.virEventRunDefaultImpl()
+            now = time.time() * 1000.0
+            timeout = int(end_time - now)
+            if timeout <= 0:
+                break
+            libvirt.virEventUpdateTimeout(timer_id, timeout)
+        libvirt.virEventRemoveTimeout(timer_id)
+        self.conn.domainEventDeregisterAny(callback_id)
+        return 0 if current_state == target_state else -1
 
     def shutdown(self, vmid):
-        return self.find_vm(vmid).shutdown()
+        return self.wait_for_state(
+            vmid,
+            lambda vm: vm.shutdown(),
+            #lambda vm: vm.shutdownFlags(libvirt.VIR_DOMAIN_SHUTDOWN_ACPI_POWER_BTN),
+            libvirt.VIR_DOMAIN_SHUTOFF) 
 
     def pause(self, vmid):
         return self.suspend(self.conn,vmid)
@@ -207,7 +235,10 @@ class LibvirtConnection(object):
         return self.find_vm(vmid).destroy()
 
     def undefine(self, vmid):
-        return self.find_vm(vmid).undefine()
+        try:
+            return self.find_defined_vm(vmid).undefine()
+        except VMNotFound:
+            return 0
 
     def get_status2(self, vm):
         state = vm.info()[0]
@@ -252,16 +283,21 @@ class LibvirtConnection(object):
 
 class Virt(object):
 
-    def __init__(self, uri, module):
-        self.module = module
-        self.uri = uri
+    def __init__(self, module):
+        uri = module.params.get('uri', None)
+        self.conn = LibvirtConnection(uri, module)
 
-    def __get_conn(self):
-        self.conn = LibvirtConnection(self.uri, self.module)
-        return self.conn
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        try:
+            self.conn.close()
+        except:
+            pass
+        return False # re-raises any exception
 
     def get_vm(self, vmid):
-        self.__get_conn()
         return self.conn.find_vm(vmid)
 
     def state(self):
@@ -294,7 +330,6 @@ class Virt(object):
         return info
 
     def nodeinfo(self):
-        self.__get_conn()
         info = dict()
         data = self.conn.nodeinfo()
         info = {
@@ -310,7 +345,6 @@ class Virt(object):
         return info
 
     def list_vms(self, state=None):
-        self.conn = self.__get_conn()
         vms = self.conn.find_vm(-1)
         results = []
         for x in vms:
@@ -326,63 +360,48 @@ class Virt(object):
         return results
 
     def virttype(self):
-        return self.__get_conn().get_type()
+        return self.conn.get_type()
 
     def autostart(self, vmid):
-        self.conn = self.__get_conn()
         return self.conn.set_autostart(vmid, True)
 
     def freemem(self):
-        self.conn = self.__get_conn()
         return self.conn.getFreeMemory()
 
     def shutdown(self, vmid):
-        """ Make the machine with the given vmid stop running.  Whatever that takes.  """
-        self.__get_conn()
-        self.conn.shutdown(vmid)
+        """ Make the machine with the given vmid stop running.  Whatever that takes."""
+        return self.conn.shutdown(vmid)
         return 0
-
 
     def pause(self, vmid):
         """ Pause the machine with the given vmid.  """
-
-        self.__get_conn()
         return self.conn.suspend(vmid)
 
     def unpause(self, vmid):
         """ Unpause the machine with the given vmid.  """
-
-        self.__get_conn()
         return self.conn.resume(vmid)
 
     def create(self, vmid):
         """ Start the machine via the given vmid """
-
-        self.__get_conn()
         return self.conn.create(vmid)
 
     def start(self, vmid):
         """ Start the machine via the given id/name """
-
-        self.__get_conn()
         return self.conn.create(vmid)
 
     def destroy(self, vmid):
         """ Pull the virtual power from the virtual domain, giving it virtually no time to virtually shut down.  """
-        self.__get_conn()
         return self.conn.destroy(vmid)
 
     def undefine(self, vmid):
         """ Stop a domain, and then wipe it from the face of the earth.  (delete disk/config file) """
 
-        self.__get_conn()
         return self.conn.undefine(vmid)
 
     def status(self, vmid):
         """
         Return a state suitable for server consumption.  Aka, codes.py values, not XM output.
         """
-        self.__get_conn()
         return self.conn.get_status(vmid)
 
     def get_xml(self, vmid):
@@ -390,42 +409,33 @@ class Virt(object):
         Receive a Vm id as input
         Return an xml describing vm config returned by a libvirt call
         """
-
-        self.__get_conn()
         return self.conn.get_xml(vmid)
 
     def get_maxVcpus(self, vmid):
         """
         Gets the max number of VCPUs on a guest
         """
-
-        self.__get_conn()
         return self.conn.get_maxVcpus(vmid)
 
     def get_max_memory(self, vmid):
         """
         Gets the max memory on a guest
         """
-
-        self.__get_conn()
         return self.conn.get_MaxMemory(vmid)
 
     def define(self, xml):
         """
         Define a guest with the given xml
         """
-        self.__get_conn()
         return self.conn.define_from_xml(xml)
 
-def core(module):
+def core(v, module):
 
     state      = module.params.get('state', None)
     guest      = module.params.get('name', None)
     command    = module.params.get('command', None)
-    uri        = module.params.get('uri', None)
     xml        = module.params.get('xml', None)
 
-    v = Virt(uri, module)
     res = {}
 
     if state and command=='list_vms':
@@ -447,13 +457,19 @@ def core(module):
                 res['changed'] = True
                 res['msg'] = v.start(guest)
         elif state == 'shutdown':
-            if v.status(guest) is not 'shutdown':
-                res['changed'] = True
-                res['msg'] = v.shutdown(guest)
+            try:
+                if v.status(guest) not in ('shutdown', 'shutting_down', 'crashed'):
+                    res['changed'] = True
+                    res['msg'] = v.shutdown(guest)
+            except VMNotFound:
+                pass
         elif state == 'destroyed':
-            if v.status(guest) is not 'shutdown':
-                res['changed'] = True
-                res['msg'] = v.destroy(guest)
+            try:
+                if v.status(guest) not in ('shutdown','crashed'):
+                    res['changed'] = True
+                    res['msg'] = v.destroy(guest)
+            except VMNotFound:
+                pass
         elif state == 'paused':
             if v.status(guest) is 'running':
                 res['changed'] = True
@@ -509,9 +525,11 @@ def main():
 
     rc = VIRT_SUCCESS
     try:
-        rc, result = core(module)
+        libvirt.virEventRegisterDefaultImpl()
+        with Virt(module) as v:
+            rc, result = core(v, module)
     except Exception, e:
-        module.fail_json(msg=str(e))
+        module.fail_json(msg=(e.__class__.__name__+str(e)))
 
     if rc != 0: # something went wrong emit the msg
         module.fail_json(rc=rc, msg=result)
