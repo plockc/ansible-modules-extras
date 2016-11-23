@@ -186,18 +186,22 @@ class LibvirtConnection(object):
 
     def wait_for_state(self, vmid, action, target_state):
         vm = self.find_vm(vmid)
-        current_state = vm.info()[0]
         def event_callback(conn, domain, event, detail, opaque):
             current_state = event
         callback_id = self.conn.domainEventRegisterAny(
             vm, libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE, event_callback, None)
+        # check state after registering to make sure we get the events
+        current_state = vm.info()[0]
+        if current_state == target_state:
+            self.conn.domainEventDeregisterAny(callback_id)
+            return 0
         def timer_callback(timer, opaque):
-            pass
         now = time.time() * 1000.0
-        timeout = 5000
+        timeout = 15000
         end_time = now + timeout
         timer_id = libvirt.virEventAddTimeout(int(timeout), timer_callback, None)
         action(vm)
+        current_state = vm.info()[0]
         while current_state != target_state:
             libvirt.virEventRunDefaultImpl()
             now = time.time() * 1000.0
@@ -207,7 +211,7 @@ class LibvirtConnection(object):
             libvirt.virEventUpdateTimeout(timer_id, timeout)
         libvirt.virEventRemoveTimeout(timer_id)
         self.conn.domainEventDeregisterAny(callback_id)
-        return 0 if current_state == target_state else -1
+        return 0 if (vm.info()[0] == target_state) else -1
 
     def shutdown(self, vmid):
         return self.wait_for_state(
@@ -229,10 +233,17 @@ class LibvirtConnection(object):
         return self.find_vm(vmid).resume()
 
     def create(self, vmid):
+        return self.wait_for_state(
+            vmid,
+            lambda vm: vm.create(),
+            libvirt.VIR_DOMAIN_RUNNING) 
         return self.find_vm(vmid).create()
 
     def destroy(self, vmid):
-        return self.find_vm(vmid).destroy()
+        return self.wait_for_state(
+            vmid,
+            lambda vm: vm.destroyFlags(libvirt.VIR_DOMAIN_DESTROY_GRACEFUL),
+            libvirt.VIR_DOMAIN_SHUTOFF) 
 
     def undefine(self, vmid):
         try:
@@ -286,6 +297,7 @@ class Virt(object):
     def __init__(self, module):
         uri = module.params.get('uri', None)
         self.conn = LibvirtConnection(uri, module)
+        self.force = module.params.get('force')
 
     def __enter__(self):
         return self
@@ -369,9 +381,13 @@ class Virt(object):
         return self.conn.getFreeMemory()
 
     def shutdown(self, vmid):
-        """ Make the machine with the given vmid stop running.  Whatever that takes."""
-        return self.conn.shutdown(vmid)
-        return 0
+        """ Make the machine with the given vmid stop running.
+        
+        force module parameter does a destory if shutdown does not work"""
+        shutdown_ok = self.conn.shutdown(vmid)
+        if shutdown_ok != 0 and self.force:
+            return self.conn.destroy(vmid)
+        return shutdown_ok
 
     def pause(self, vmid):
         """ Pause the machine with the given vmid.  """
@@ -459,8 +475,10 @@ def core(v, module):
         elif state == 'shutdown':
             try:
                 if v.status(guest) not in ('shutdown', 'shutting_down', 'crashed'):
+                    shutdown_result = v.shutdown(guest)
+                    if shutdown_result == -1:
+                        module.fail_json(msg="failed to shutdown: %s" % v.status(guest))
                     res['changed'] = True
-                    res['msg'] = v.shutdown(guest)
             except VMNotFound:
                 pass
         elif state == 'destroyed':
@@ -514,6 +532,7 @@ def main():
         name = dict(aliases=['guest']),
         state = dict(choices=['running', 'shutdown', 'destroyed', 'paused']),
         command = dict(choices=ALL_COMMANDS),
+        force = dict(type='bool', default=False),
         uri = dict(default='qemu:///system'),
         xml = dict(),
     ))
